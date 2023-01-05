@@ -1,9 +1,9 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, sync::Arc, borrow::{Borrow, Cow}, collections::{HashMap, HashSet}};
 
 use pulse::{
-    context::{subscribe::{InterestMaskSet, Facility}, Context, FlagSet, State},
+    context::{subscribe::{InterestMaskSet, Facility}, Context, FlagSet, State, introspect::{SinkInfo, SourceInfo, SourcePortInfo, CardInfo}},
     mainloop::standard::Mainloop,
-    proplist::Proplist, callbacks::ListResult
+    proplist::Proplist, callbacks::ListResult, def::PortAvailable
 };
 use zbus::blocking::Connection;
 
@@ -41,12 +41,10 @@ impl EventsWatcher {
             }
         }
 
-        let dbus = Connection::session().expect("Failed to connect to dbus");
-
         Ok(EventsWatcher {
             mainloop,
             context: Arc::new(RefCell::new(context)),
-            dbus: Arc::new(RefCell::new(dbus))
+            dbus: Arc::new(RefCell::new(Connection::session().expect("Failed to connect to dbus")))
         })
     }
 }
@@ -55,26 +53,109 @@ fn main() {
     let interest = InterestMaskSet::SINK | InterestMaskSet::SOURCE;
     // let interest = InterestMaskSet::ALL;
 
-    let mut ew = EventsWatcher::new().expect("Failed to create mainloop or context");
+    let mut watcher = EventsWatcher::new().expect("Failed to create mainloop or context");
 
-    let ctx = ew.context.clone();
+    let dbus = watcher.dbus.clone();
 
-    let cb = Box::new(move |facility, operation, index| {
-        println!("{:?} {:?} #{}", facility, operation, index);
-        let dbus = ew.dbus.clone();
+    let dbus_call = move |code: &str| {
+        let reply = (*dbus).borrow().call_method(
+            Some("org.awesomewm.awful"), "/",
+            Some("org.awesomewm.awful.Remote"), "Eval",
+            &code
+        );
 
-        let dbus_call = move |code: &str| {
-            let reply = dbus.borrow().call_method(
-                Some("org.awesomewm.awful"), "/",
-                Some("org.awesomewm.awful.Remote"), "Eval",
-                &code
-            );
+        match reply {
+            Ok(message) => { debug!("{:?}", message) },
+            Err(_) => {},
+        }
+    };
 
-            match reply {
-                Ok(message) => { debug!("{:?}", message) },
-                Err(_) => {},
+    let dbus_call2 = dbus_call.clone();
+
+    let prev_vol = Arc::new(RefCell::new(String::new()));
+
+    let sink_cb = move |result: ListResult<&SinkInfo>| {
+        match result {
+            ListResult::Item(sink) => {
+                let cur_vol = format!("{}_{}", sink.volume.avg(), sink.mute);
+
+                if *(*prev_vol).borrow() != cur_vol {
+                    let code = format!(
+                        "awesome.emit_signal('volume::change', '{}', {})",
+                        sink.volume.avg().print().trim(), sink.mute
+                    );
+
+                    debug!("{}", &code);
+
+                    dbus_call(&code);
+                    *prev_vol.borrow_mut() = cur_vol;
+                } else {
+                    debug!("same vol");
+                }
             }
-        };
+            _ => {}
+        }
+    };
+
+    let card_cb = move |result: ListResult<&CardInfo>| {
+
+        match result {
+            ListResult::Item(card) => {
+                // println!("source state: {:?}", source.state);
+                // println!("{:?}", card.profiles);
+                for profile in &card.profiles {
+                    if profile.available {
+                        println!("{:?} {:?}", profile.name.as_ref().unwrap(), profile.description.as_ref().unwrap());
+                    }
+                }
+                println!("{:?}", card.active_profile);
+            },
+            _ => {}
+        }
+    };
+
+    let prev_ports = Arc::new(RefCell::new(HashSet::new()));
+
+    let source_cb = move |result: ListResult<&SourceInfo>| {
+        match result {
+            ListResult::Item(source) => {
+                // println!("{:?}", source);
+
+                // for ele in &source.ports {
+                //     println!("{:?} {:?} {:?}", ele.name, ele.description, ele.available);
+                // }
+
+                let mut ports: HashSet<String> = HashSet::new();
+                for port in &source.ports {
+                    if port.available != PortAvailable::No {
+                        ports.insert(port.name.clone().unwrap().to_string());
+                    }
+                }
+
+                if *(*prev_ports).borrow() != ports {
+                    if ports.len() > 1 {
+                        let code = format!(
+                            "awesome.emit_signal('headset::connected', '{}')",
+                            ports.clone().into_iter().collect::<Vec<String>>().join("', '")
+                        );
+
+                        println!("{}", &code);
+
+                        dbus_call2(&code);
+                    }
+
+                    println!("{:?}", ports);
+
+                    *prev_ports.borrow_mut() = ports;
+                }
+            }
+            _ => {}
+        }
+    };
+
+    let ctx = watcher.context.clone();
+    let cb = move |facility, operation, index| {
+        println!("{:?} {:?} #{}", facility, operation, index);
 
         // ctx.borrow().introspect().get_server_info(|result| {
         //     println!("{:?}", result);
@@ -82,44 +163,22 @@ fn main() {
 
         match facility {
             Some(Facility::Sink) => {
-                ctx.borrow().introspect().get_sink_info_by_index(index, move |result| {
-                    match result {
-                        ListResult::Item(sink) => {
-                            let code = format!(
-                                "awesome.emit_signal('volume::change', '{}', {})",
-                                sink.volume.avg().print(), sink.mute
-                            );
-
-                            debug!("{}", &code);
-
-                            dbus_call(&code);
-                        }
-                        _ => {}
-                    }
-                });
+                (*ctx).borrow().introspect().get_sink_info_by_index(index, sink_cb.clone());
             },
             Some(Facility::Source) => {
-                ctx.borrow().introspect().get_source_info_by_index(index, move |result| {
-                    match result {
-                        ListResult::Item(source) => {
-                            // println!("{:?}", source);
-
-                            for ele in &source.ports {
-                                println!("{:?}", ele);
-                            }
-                        }
-                        _ => {}
-                    }
-                });
-            }
+                (*ctx).borrow().introspect().get_source_info_by_index(index, source_cb.clone());
+            },
+            // Some(Facility::Card) => {
+            //     (*ctx).borrow().introspect().get_card_info_by_index(index, card_cb.clone());
+            // },
             _ => {}
         }
-    });
+    };
 
-    ew.context.borrow_mut().set_subscribe_callback(Some(cb));
-    ew.context.borrow_mut().subscribe(interest, |_| {});
+    watcher.context.borrow_mut().set_subscribe_callback(Some(Box::new(cb)));
+    watcher.context.borrow_mut().subscribe(interest, |_| {});
 
     loop {
-        ew.mainloop.iterate(true);
+        watcher.mainloop.iterate(true);
     }
 }
