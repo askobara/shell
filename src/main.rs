@@ -1,184 +1,127 @@
-use std::{cell::RefCell, sync::Arc, borrow::{Borrow, Cow}, collections::{HashMap, HashSet}};
-
-use pulse::{
-    context::{subscribe::{InterestMaskSet, Facility}, Context, FlagSet, State, introspect::{SinkInfo, SourceInfo, SourcePortInfo, CardInfo}},
-    mainloop::standard::Mainloop,
-    proplist::Proplist, callbacks::ListResult, def::PortAvailable
-};
-use zbus::blocking::Connection;
-
-use anyhow::Result;
+use std::{collections::HashMap};
+use std::{env, fmt};
+use std::error::Error;
+use std::io;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::UnixStream;
 use log::debug;
 
-const PA_NAME: &str = "pa-events-watcher";
+use anyhow::Result;
 
-pub struct EventsWatcher {
-    mainloop: Mainloop,
-    context: Arc<RefCell<Context>>,
-    dbus: Arc<RefCell<Connection>>
+use zbus::{Connection, proxy, zvariant::Value};
+
+mod pulseaudio;
+mod hyprland;
+
+enum Icon {
+    Keyboard,
+    Sound,
+    Muted,
+    DotFull,
+    DotOutline,
+    Microphone,
+    Brightness,
 }
 
-impl EventsWatcher {
-    fn new() -> Result<EventsWatcher> {
-        let mut mainloop = Mainloop::new().expect("Failed to create mainloop");
-        let mut proplist = Proplist::new().expect("Failed to create proplist");
-
-        proplist
-            .set_str(pulse::proplist::properties::APPLICATION_NAME, PA_NAME)
-            .expect("Failed to set APPLICATION_NAME");
-
-        let mut context = Context::new_with_proplist(&mainloop, PA_NAME, &proplist)
-            .expect("Failed to create new context");
-
-        context.connect(None, FlagSet::NOFLAGS, None)
-            .expect("Failed to connect to default server");
-
-        loop {
-            mainloop.iterate(true);
-            match context.get_state() {
-                State::Ready => { debug!("ready"); break; },
-                _ => { debug!("wait") }
-            }
+impl Icon {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Icon::Keyboard => "",
+            Icon::Sound => "",
+            Icon::Muted => "󰖁",
+            Icon::DotFull => "●",
+            Icon::DotOutline => "○",
+            Icon::Microphone => "",
+            Icon::Brightness => "󰃠",
         }
+    }
+}
 
-        Ok(EventsWatcher {
-            mainloop,
-            context: Arc::new(RefCell::new(context)),
-            dbus: Arc::new(RefCell::new(Connection::session().expect("Failed to connect to dbus")))
+impl fmt::Display for Icon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[proxy(
+    default_service = "org.freedesktop.Notifications",
+    default_path = "/org/freedesktop/Notifications"
+)]
+trait Notifications {
+    /// Call the org.freedesktop.Notifications.Notify D-Bus method
+    fn notify(
+        &self,
+        app_name: &str,
+        replaces_id: u32,
+        app_icon: &str,
+        summary: &str,
+        body: &str,
+        actions: &[&str],
+        hints: HashMap<&str, &Value<'_>>,
+        expire_timeout: i32,
+    ) -> zbus::Result<u32>;
+}
+
+struct Notif<'p> {
+    name: String,
+    proxy: NotificationsProxy<'p>,
+}
+
+impl<'p> Notif<'p> {
+    async fn new(name: &str, dbus: &Connection) -> Result<Self> {
+
+        Ok(Self {
+            name: name.to_owned(),
+            proxy: NotificationsProxy::new(&dbus).await?,
         })
     }
+
+    async fn send_notif(&self, msg: &str) -> Result<()> {
+        self.proxy
+            .notify(
+                &self.name,
+                0,
+                "",
+                &msg,
+                "",
+                &[],
+                HashMap::from([
+                    ("category", &Value::from("osd")),
+                    ("x-canonical-private-synchronous", &Value::from("osd")),
+                ]),
+                700,
+            )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn layout_change(&self, layout_name: &str) -> Result<()> {
+        self.send_notif(&format!("{} {}", Icon::Keyboard, &layout_name.to_lowercase()[..2])).await
+    }
+
+    pub async fn workspace_change(&self, workspace_id: &str, workspaces: &[hyprland::Workspace]) -> Result<()> {
+        let id: u32 = workspace_id.parse()?;
+        let msg: Vec<&str> = workspaces.iter()
+            .map(|ws| {if ws.id == id { Icon::DotFull } else { Icon::DotOutline }}.as_str())
+            .collect();
+
+        self.send_notif(&msg.join(" ")).await
+    }
 }
 
-fn main() {
-    let interest = InterestMaskSet::SINK | InterestMaskSet::SOURCE;
-    // let interest = InterestMaskSet::ALL;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let dbus = Connection::session().await?;
+    let n = Notif::new("my-app", &dbus).await?;
 
-    let mut watcher = EventsWatcher::new().expect("Failed to create mainloop or context");
+    let signature = env::var("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let runtime_dir = env::var("XDG_RUNTIME_DIR")?;
 
-    let dbus = watcher.dbus.clone();
+    let ipc_socket = format!("{runtime_dir}/hypr/{signature}/.socket.sock");
+    let events_socket = format!("{runtime_dir}/hypr/{signature}/.socket2.sock");
 
-    let dbus_call = move |code: &str| {
-        let reply = (*dbus).borrow().call_method(
-            Some("org.awesomewm.awful"), "/",
-            Some("org.awesomewm.awful.Remote"), "Eval",
-            &code
-        );
+    hyprland::events(&ipc_socket, &events_socket, &n).await?;
 
-        match reply {
-            Ok(message) => { debug!("{:?}", message) },
-            Err(_) => {},
-        }
-    };
-
-    let dbus_call2 = dbus_call.clone();
-
-    let prev_vol = Arc::new(RefCell::new(String::new()));
-
-    let sink_cb = move |result: ListResult<&SinkInfo>| {
-        match result {
-            ListResult::Item(sink) => {
-                let cur_vol = format!("{}_{}", sink.volume.avg(), sink.mute);
-
-                if *(*prev_vol).borrow() != cur_vol {
-                    let code = format!(
-                        "awesome.emit_signal('volume::change', '{}', {})",
-                        sink.volume.avg().print().trim(), sink.mute
-                    );
-
-                    debug!("{}", &code);
-
-                    dbus_call(&code);
-                    *prev_vol.borrow_mut() = cur_vol;
-                } else {
-                    debug!("same vol");
-                }
-            }
-            _ => {}
-        }
-    };
-
-    let card_cb = move |result: ListResult<&CardInfo>| {
-
-        match result {
-            ListResult::Item(card) => {
-                // println!("source state: {:?}", source.state);
-                // println!("{:?}", card.profiles);
-                for profile in &card.profiles {
-                    if profile.available {
-                        println!("{:?} {:?}", profile.name.as_ref().unwrap(), profile.description.as_ref().unwrap());
-                    }
-                }
-                println!("{:?}", card.active_profile);
-            },
-            _ => {}
-        }
-    };
-
-    let prev_ports = Arc::new(RefCell::new(HashSet::new()));
-
-    let source_cb = move |result: ListResult<&SourceInfo>| {
-        match result {
-            ListResult::Item(source) => {
-                // println!("{:?}", source);
-
-                // for ele in &source.ports {
-                //     println!("{:?} {:?} {:?}", ele.name, ele.description, ele.available);
-                // }
-
-                let mut ports: HashSet<String> = HashSet::new();
-                for port in &source.ports {
-                    if port.available != PortAvailable::No {
-                        ports.insert(port.name.clone().unwrap().to_string());
-                    }
-                }
-
-                if *(*prev_ports).borrow() != ports {
-                    if ports.len() > 1 {
-                        let code = format!(
-                            "awesome.emit_signal('headset::connected', '{}')",
-                            ports.clone().into_iter().collect::<Vec<String>>().join("', '")
-                        );
-
-                        println!("{}", &code);
-
-                        dbus_call2(&code);
-                    }
-
-                    println!("{:?}", ports);
-
-                    *prev_ports.borrow_mut() = ports;
-                }
-            }
-            _ => {}
-        }
-    };
-
-    let ctx = watcher.context.clone();
-    let cb = move |facility, operation, index| {
-        println!("{:?} {:?} #{}", facility, operation, index);
-
-        // ctx.borrow().introspect().get_server_info(|result| {
-        //     println!("{:?}", result);
-        // });
-
-        match facility {
-            Some(Facility::Sink) => {
-                (*ctx).borrow().introspect().get_sink_info_by_index(index, sink_cb.clone());
-            },
-            Some(Facility::Source) => {
-                (*ctx).borrow().introspect().get_source_info_by_index(index, source_cb.clone());
-            },
-            // Some(Facility::Card) => {
-            //     (*ctx).borrow().introspect().get_card_info_by_index(index, card_cb.clone());
-            // },
-            _ => {}
-        }
-    };
-
-    watcher.context.borrow_mut().set_subscribe_callback(Some(Box::new(cb)));
-    watcher.context.borrow_mut().subscribe(interest, |_| {});
-
-    loop {
-        watcher.mainloop.iterate(true);
-    }
+    Ok(())
 }

@@ -1,12 +1,16 @@
 [package]
-name = "pa-events-watcher"
-version = "0.1.0"
-edition = "2021"
+name = "shell"
+version = "0.2.0"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 pulse = { version = "2.26.0", package = "libpulse-binding" }
-zbus = "3.0.0"
+zbus = { version = "5.15.0", features = ["tokio"] }
 anyhow = "1.0"
 log = "0.4"
+tokio = { version = "1.52.3", features = ["full", "net"] }
+xkbcommon = { version = "0.9.0", features = ["wayland"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
