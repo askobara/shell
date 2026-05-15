@@ -5,9 +5,11 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
 use log::debug;
+use serde::{Deserialize, Serialize};
 
 use anyhow::Result;
 
+use tokio::sync::mpsc::{self, Receiver};
 use zbus::{Connection, proxy, zvariant::Value};
 
 mod pulseaudio;
@@ -15,7 +17,7 @@ mod hyprland;
 
 enum Icon {
     Keyboard,
-    Sound,
+    Volume,
     Muted,
     DotFull,
     DotOutline,
@@ -27,7 +29,7 @@ impl Icon {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Icon::Keyboard => "",
-            Icon::Sound => "",
+            Icon::Volume => "",
             Icon::Muted => "󰖁",
             Icon::DotFull => "●",
             Icon::DotOutline => "○",
@@ -41,6 +43,30 @@ impl fmt::Display for Icon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+#[derive(Debug)]
+enum Command {
+    KeyboardLayout {
+        name: String,
+    },
+    ActiveWorkspace {
+        id: String,
+        workspaces: Vec<Workspace>,
+    },
+    Volume {
+        value: String,
+        mute: bool,
+    },
+    Source {
+        ports: Vec<String>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Workspace {
+    pub id: u32,
+    pub name: Option<String>,
 }
 
 #[proxy(
@@ -62,21 +88,49 @@ trait Notifications {
     ) -> zbus::Result<u32>;
 }
 
-struct Notif<'p> {
+struct DbusManager<'p> {
     name: String,
+    dbus: &'p Connection,
     proxy: NotificationsProxy<'p>,
 }
 
-impl<'p> Notif<'p> {
-    async fn new(name: &str, dbus: &Connection) -> Result<Self> {
+impl<'p> DbusManager<'p> {
+    async fn new(name: &str, dbus: &'p Connection) -> Result<Self> {
 
         Ok(Self {
             name: name.to_owned(),
+            dbus: dbus,
             proxy: NotificationsProxy::new(&dbus).await?,
         })
     }
 
-    async fn send_notif(&self, msg: &str) -> Result<()> {
+    async fn run(&self, rx: &mut Receiver<Command>) -> Result<()> {
+        while let Some(message) = rx.recv().await {
+            match message {
+                Command::ActiveWorkspace { id, workspaces } => self.workspace_change(&id, &workspaces).await?,
+                Command::KeyboardLayout { name } => {
+                    self.send_notification(&format!("{} {}", Icon::Keyboard, &name.to_lowercase()[..2])).await?;
+                },
+                Command::Volume { value, mute } => {
+                    if mute {
+                        self.send_notification(Icon::Muted.as_str()).await?;
+                    } else {
+                        self.send_notification(&format!("{} {value}", Icon::Volume)).await?;
+                    }
+                },
+                Command::Source { ports } => {
+                    debug!("{ports:?}");
+                },
+                _ => {
+                    println!("GOT = {:?}", message);
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_notification(&self, msg: &str) -> Result<()> {
         self.proxy
             .notify(
                 &self.name,
@@ -96,32 +150,42 @@ impl<'p> Notif<'p> {
         Ok(())
     }
 
-    pub async fn layout_change(&self, layout_name: &str) -> Result<()> {
-        self.send_notif(&format!("{} {}", Icon::Keyboard, &layout_name.to_lowercase()[..2])).await
-    }
-
-    pub async fn workspace_change(&self, workspace_id: &str, workspaces: &[hyprland::Workspace]) -> Result<()> {
+    async fn workspace_change(&self, workspace_id: &str, workspaces: &[Workspace]) -> Result<()> {
         let id: u32 = workspace_id.parse()?;
         let msg: Vec<&str> = workspaces.iter()
             .map(|ws| {if ws.id == id { Icon::DotFull } else { Icon::DotOutline }}.as_str())
             .collect();
 
-        self.send_notif(&msg.join(" ")).await
+        self.send_notification(&msg.join(" ")).await
+    }
+
+    pub async fn awesomewm_eval(&self, code: &str) -> Result<zbus::Message> {
+        self.dbus.call_method(
+            Some("org.awesomewm.awful"),
+            "/",
+            Some("org.awesomewm.awful.Remote"),
+            "Eval",
+            &code,
+        ).await.map_err(|e| anyhow::Error::from(e))
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
+    // Create a new channel with a capacity of at most 32.
+    let (tx, mut rx) = mpsc::channel::<Command>(32);
+    let tx2 = tx.clone();
+
     let dbus = Connection::session().await?;
-    let n = Notif::new("my-app", &dbus).await?;
+    let manager = DbusManager::new("my-app", &dbus).await?;
 
-    let signature = env::var("HYPRLAND_INSTANCE_SIGNATURE")?;
-    let runtime_dir = env::var("XDG_RUNTIME_DIR")?;
+    tokio::task::spawn_blocking(move || {
+        let _ = pulseaudio::events(tx);
+    });
 
-    let ipc_socket = format!("{runtime_dir}/hypr/{signature}/.socket.sock");
-    let events_socket = format!("{runtime_dir}/hypr/{signature}/.socket2.sock");
+    tokio::spawn(async move {
+        let _ = hyprland::events(&tx2).await;
+    });
 
-    hyprland::events(&ipc_socket, &events_socket, &n).await?;
-
-    Ok(())
+    manager.run(&mut rx).await
 }

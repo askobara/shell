@@ -1,210 +1,139 @@
+use anyhow::{Result, anyhow};
 use log::debug;
 use std::{
-    borrow::{Borrow, Cow},
     cell::RefCell,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    rc::Rc,
 };
-use anyhow::Result;
+use tokio::sync::{mpsc::Sender};
 
 use pulse::{
     callbacks::ListResult,
     context::{
-        introspect::{CardInfo, SinkInfo, SourceInfo, SourcePortInfo},
-        subscribe::{Facility, InterestMaskSet},
         Context, FlagSet, State,
+        introspect::{CardInfo, Introspector, SinkInfo, SourceInfo, SourcePortInfo},
+        subscribe::{Facility, InterestMaskSet},
     },
     def::PortAvailable,
-    mainloop::standard::Mainloop,
+    mainloop::standard::{IterateResult, Mainloop},
     proplist::Proplist,
 };
+use std::ops::Deref;
 use zbus::blocking::Connection;
+
+use crate::Command;
 
 const PA_NAME: &str = "pa-events-watcher";
 
 pub struct EventsWatcher {
-    mainloop: Mainloop,
-    context: Arc<RefCell<Context>>,
-    dbus: Arc<RefCell<Connection>>,
+    mainloop: Rc<RefCell<Mainloop>>,
+    context: Rc<RefCell<Context>>,
 }
 
 impl EventsWatcher {
     fn new() -> Result<EventsWatcher> {
-        let mut mainloop = Mainloop::new().expect("Failed to create mainloop");
-        let mut proplist = Proplist::new().expect("Failed to create proplist");
+        let mut proplist = Proplist::new().unwrap();
 
         proplist
             .set_str(pulse::proplist::properties::APPLICATION_NAME, PA_NAME)
-            .expect("Failed to set APPLICATION_NAME");
+            .unwrap();
 
-        let mut context = Context::new_with_proplist(&mainloop, PA_NAME, &proplist)
-            .expect("Failed to create new context");
+        let mainloop = match Mainloop::new() {
+            Some(mainloop) => Rc::new(RefCell::new(mainloop)),
+            None => return Err(anyhow!("Failed to create mainloop")),
+        };
+
+        let context =
+            match Context::new_with_proplist(mainloop.borrow().deref(), PA_NAME, &proplist) {
+                Some(context) => Rc::new(RefCell::new(context)),
+                None => return Err(anyhow!("Failed to create new context")),
+            };
 
         context
+            .borrow_mut()
             .connect(None, FlagSet::NOFLAGS, None)
-            .expect("Failed to connect to default server");
+            .map_err(|e| anyhow::Error::from(e))?;
 
         loop {
-            mainloop.iterate(true);
-            match context.get_state() {
+            match mainloop.borrow_mut().iterate(false) {
+                IterateResult::Quit(_) | IterateResult::Err(_) => {
+                    return Err(anyhow!("Iterate state was not success, quitting..."));
+                }
+                IterateResult::Success(_) => {}
+            }
+
+            match context.borrow().get_state() {
                 State::Ready => {
-                    debug!("ready");
                     break;
                 }
-                _ => {
-                    debug!("wait")
+                State::Failed | State::Terminated => {
+                    return Err(anyhow!("Context state failed/terminated, quitting..."));
                 }
+                _ => {}
             }
         }
 
         Ok(EventsWatcher {
             mainloop,
-            context: Arc::new(RefCell::new(context)),
-            dbus: Arc::new(RefCell::new(
-                Connection::session().expect("Failed to connect to dbus"),
-            )),
+            context,
         })
     }
 }
 
-fn events() {
-    let interest = InterestMaskSet::SINK | InterestMaskSet::SOURCE;
-    // let interest = InterestMaskSet::ALL;
+impl Drop for EventsWatcher {
+    fn drop(&mut self) {
+        self.context.borrow_mut().disconnect();
+        self.mainloop.borrow_mut().quit(pulse::def::Retval(0));
+    }
+}
 
-    let mut watcher = EventsWatcher::new().expect("Failed to create mainloop or context");
-
-    let dbus = watcher.dbus.clone();
-
-    let dbus_call = move |code: &str| {
-        let reply = (*dbus).borrow().call_method(
-            Some("org.awesomewm.awful"),
-            "/",
-            Some("org.awesomewm.awful.Remote"),
-            "Eval",
-            &code,
-        );
-
-        match reply {
-            Ok(message) => {
-                debug!("{:?}", message)
-            }
-            Err(_) => {}
-        }
-    };
-
-    let dbus_call2 = dbus_call.clone();
-
-    let prev_vol = Arc::new(RefCell::new(String::new()));
-
-    let sink_cb = move |result: ListResult<&SinkInfo>| match result {
-        ListResult::Item(sink) => {
-            let cur_vol = format!("{}_{}", sink.volume.avg(), sink.mute);
-
-            if *(*prev_vol).borrow() != cur_vol {
-                let code = format!(
-                    "awesome.emit_signal('volume::change', '{}', {})",
-                    sink.volume.avg().print().trim(),
-                    sink.mute
-                );
-
-                debug!("{}", &code);
-
-                dbus_call(&code);
-                *prev_vol.borrow_mut() = cur_vol;
-            } else {
-                debug!("same vol");
-            }
-        }
-        _ => {}
-    };
-
-    let card_cb = move |result: ListResult<&CardInfo>| {
-        match result {
-            ListResult::Item(card) => {
-                // println!("source state: {:?}", source.state);
-                // println!("{:?}", card.profiles);
-                for profile in &card.profiles {
-                    if profile.available {
-                        println!(
-                            "{:?} {:?}",
-                            profile.name.as_ref().unwrap(),
-                            profile.description.as_ref().unwrap()
-                        );
-                    }
-                }
-                println!("{:?}", card.active_profile);
-            }
-            _ => {}
-        }
-    };
-
-    let prev_ports = Arc::new(RefCell::new(HashSet::new()));
-
-    let source_cb = move |result: ListResult<&SourceInfo>| {
-        match result {
-            ListResult::Item(source) => {
-                // println!("{:?}", source);
-
-                // for ele in &source.ports {
-                //     println!("{:?} {:?} {:?}", ele.name, ele.description, ele.available);
-                // }
-
-                let mut ports: HashSet<String> = HashSet::new();
-                for port in &source.ports {
-                    if port.available != PortAvailable::No {
-                        ports.insert(port.name.clone().unwrap().to_string());
-                    }
-                }
-
-                if *(*prev_ports).borrow() != ports {
-                    if ports.len() > 1 {
-                        let code = format!(
-                            "awesome.emit_signal('headset::connected', '{}')",
-                            ports
-                                .clone()
-                                .into_iter()
-                                .collect::<Vec<String>>()
-                                .join("', '")
-                        );
-
-                        println!("{}", &code);
-
-                        dbus_call2(&code);
-                    }
-
-                    println!("{:?}", ports);
-
-                    *prev_ports.borrow_mut() = ports;
-                }
-            }
-            _ => {}
-        }
-    };
-
+pub fn events(tx: Sender<crate::Command>) -> Result<()> {
+    let watcher = EventsWatcher::new()?;
     let ctx = watcher.context.clone();
-    let cb = move |facility, operation, index| {
-        println!("{:?} {:?} #{}", facility, operation, index);
 
-        // ctx.borrow().introspect().get_server_info(|result| {
-        //     println!("{:?}", result);
-        // });
+    let cb = move |facility, operation, index| {
+        debug!("{:?} {:?} #{}", facility, operation, index);
 
         match facility {
             Some(Facility::Sink) => {
-                (*ctx)
-                    .borrow()
-                    .introspect()
-                    .get_sink_info_by_index(index, sink_cb.clone());
+                let tx = tx.clone();
+                ctx.borrow().introspect().get_sink_info_by_index(
+                    index,
+                    move |result: ListResult<&SinkInfo>| match result {
+                        ListResult::Item(sink) => {
+                            debug!("{:?}", sink);
+
+                            let _ = tx.blocking_send(crate::Command::Volume {
+                                value: sink.volume.avg().print().trim().to_string(),
+                                mute: sink.mute,
+                            });
+                        }
+                        _ => {}
+                    },
+                );
             }
             Some(Facility::Source) => {
-                (*ctx)
-                    .borrow()
-                    .introspect()
-                    .get_source_info_by_index(index, source_cb.clone());
+                let tx = tx.clone();
+                ctx.borrow().introspect().get_source_info_by_index(
+                    index,
+                    move |result: ListResult<&SourceInfo>| {
+                        match result {
+                            ListResult::Item(source) => {
+                                debug!("{:?}", source);
+
+                                let _ = tx.blocking_send(crate::Command::Source {
+                                    ports: source
+                                        .ports
+                                        .iter()
+                                        .filter_map(|p| p.name.as_ref().map(|n| n.to_string()))
+                                        .collect(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    },
+                );
             }
-            // Some(Facility::Card) => {
-            //     (*ctx).borrow().introspect().get_card_info_by_index(index, card_cb.clone());
-            // },
             _ => {}
         }
     };
@@ -213,10 +142,13 @@ fn events() {
         .context
         .borrow_mut()
         .set_subscribe_callback(Some(Box::new(cb)));
-    watcher.context.borrow_mut().subscribe(interest, |_| {});
+
+    watcher
+        .context
+        .borrow_mut()
+        .subscribe(InterestMaskSet::SINK | InterestMaskSet::SOURCE, |_| {});
 
     loop {
-        watcher.mainloop.iterate(true);
+        watcher.mainloop.borrow_mut().iterate(false);
     }
 }
-

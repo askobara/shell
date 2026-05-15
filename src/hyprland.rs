@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
-use std::io;
+use log::debug;
+use std::{env, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
-use log::debug;
+use tokio::sync::mpsc::Sender;
 
 use anyhow::Result;
 
@@ -19,14 +19,14 @@ use anyhow::Result;
 //     "tiledLayout": "monocle"
 // }
 
-#[derive(Serialize, Deserialize)]
-pub struct Workspace {
-    pub id: u32,
-    pub name: String,
-}
+pub async fn events(tx: &Sender<crate::Command>) -> Result<()> {
+    let signature = env::var("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let runtime_dir = env::var("XDG_RUNTIME_DIR")?;
 
-pub async fn events(ipc_path: &str, events_path: &str, notif: &crate::Notif<'_>) -> Result<()> {
-    let events = UnixStream::connect(events_path).await?;
+    let ipc_socket_path = format!("{runtime_dir}/hypr/{signature}/.socket.sock");
+    let events_socket_path = format!("{runtime_dir}/hypr/{signature}/.socket2.sock");
+
+    let events = UnixStream::connect(&events_socket_path).await?;
 
     loop {
         let ready = events.ready(Interest::READABLE).await?;
@@ -45,21 +45,30 @@ pub async fn events(ipc_path: &str, events_path: &str, notif: &crate::Notif<'_>)
                             match event_name {
                                 "activelayout" => {
                                     if let Some((_kb_name, layout_name)) = payload.split_once(',') {
-                                        notif.layout_change(layout_name).await?;
+                                        tx.send(crate::Command::KeyboardLayout {
+                                            name: layout_name.to_string(),
+                                        })
+                                        .await?;
                                     }
-                                },
+                                }
                                 "workspacev2" => {
                                     if let Some((id, _name)) = payload.split_once(',') {
-                                        let mut ipc = UnixStream::connect(ipc_path).await?;
+                                        let mut ipc =
+                                            UnixStream::connect(&ipc_socket_path).await?;
                                         ipc.write_all(b"j/workspaces").await?;
                                         let mut buffer = Vec::new();
                                         ipc.read_to_end(&mut buffer).await?;
-                                        let workspaces: Vec<Workspace> = serde_json::from_slice(&buffer)?;
+                                        let workspaces: Vec<crate::Workspace> =
+                                            serde_json::from_slice(&buffer)?;
 
-                                        notif.workspace_change(id, &workspaces).await?;
+                                        tx.send(crate::Command::ActiveWorkspace {
+                                            id: id.to_string(),
+                                            workspaces: workspaces,
+                                        })
+                                        .await?;
                                     }
                                 }
-                                _ => debug!("incoming {event_name}>>{payload}")
+                                _ => debug!("incoming {event_name}>>{payload}"),
                             }
                         }
                     }
