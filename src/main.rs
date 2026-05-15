@@ -1,9 +1,5 @@
 use std::{collections::HashMap};
-use std::{env, fmt};
-use std::error::Error;
-use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
-use tokio::net::UnixStream;
+use std::fmt;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
@@ -99,8 +95,8 @@ impl<'p> DbusManager<'p> {
 
         Ok(Self {
             name: name.to_owned(),
-            dbus: dbus,
-            proxy: NotificationsProxy::new(&dbus).await?,
+            dbus,
+            proxy: NotificationsProxy::new(dbus).await?,
         })
     }
 
@@ -118,11 +114,8 @@ impl<'p> DbusManager<'p> {
                         self.send_notification(&format!("{} {value}", Icon::Volume)).await?;
                     }
                 },
-                Command::Source { ports } => {
-                    debug!("{ports:?}");
-                },
                 _ => {
-                    println!("GOT = {:?}", message);
+                    debug!("GOT = {:?}", message);
                 },
             }
         }
@@ -136,7 +129,7 @@ impl<'p> DbusManager<'p> {
                 &self.name,
                 0,
                 "",
-                &msg,
+                msg,
                 "",
                 &[],
                 HashMap::from([
@@ -166,7 +159,7 @@ impl<'p> DbusManager<'p> {
             Some("org.awesomewm.awful.Remote"),
             "Eval",
             &code,
-        ).await.map_err(|e| anyhow::Error::from(e))
+        ).await.map_err(anyhow::Error::from)
     }
 }
 

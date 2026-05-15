@@ -63,7 +63,7 @@ pub async fn events(tx: &Sender<crate::Command>) -> Result<()> {
 
                                         tx.send(crate::Command::ActiveWorkspace {
                                             id: id.to_string(),
-                                            workspaces: workspaces,
+                                            workspaces,
                                         })
                                         .await?;
                                     }

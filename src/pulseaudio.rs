@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow};
 use log::debug;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
     rc::Rc,
 };
 use tokio::sync::{mpsc::Sender};
@@ -11,17 +10,14 @@ use pulse::{
     callbacks::ListResult,
     context::{
         Context, FlagSet, State,
-        introspect::{CardInfo, Introspector, SinkInfo, SourceInfo, SourcePortInfo},
+        introspect::{SinkInfo, SourceInfo},
         subscribe::{Facility, InterestMaskSet},
     },
-    def::PortAvailable,
     mainloop::standard::{IterateResult, Mainloop},
     proplist::Proplist,
 };
 use std::ops::Deref;
-use zbus::blocking::Connection;
 
-use crate::Command;
 
 const PA_NAME: &str = "pa-events-watcher";
 
@@ -52,7 +48,7 @@ impl EventsWatcher {
         context
             .borrow_mut()
             .connect(None, FlagSet::NOFLAGS, None)
-            .map_err(|e| anyhow::Error::from(e))?;
+            .map_err(anyhow::Error::from)?;
 
         loop {
             match mainloop.borrow_mut().iterate(false) {
@@ -99,16 +95,13 @@ pub fn events(tx: Sender<crate::Command>) -> Result<()> {
                 let tx = tx.clone();
                 ctx.borrow().introspect().get_sink_info_by_index(
                     index,
-                    move |result: ListResult<&SinkInfo>| match result {
-                        ListResult::Item(sink) => {
-                            debug!("{:?}", sink);
+                    move |result: ListResult<&SinkInfo>| if let ListResult::Item(sink) = result {
+                        debug!("{:?}", sink);
 
-                            let _ = tx.blocking_send(crate::Command::Volume {
-                                value: sink.volume.avg().print().trim().to_string(),
-                                mute: sink.mute,
-                            });
-                        }
-                        _ => {}
+                        let _ = tx.blocking_send(crate::Command::Volume {
+                            value: sink.volume.avg().print().trim().to_string(),
+                            mute: sink.mute,
+                        });
                     },
                 );
             }
@@ -117,19 +110,16 @@ pub fn events(tx: Sender<crate::Command>) -> Result<()> {
                 ctx.borrow().introspect().get_source_info_by_index(
                     index,
                     move |result: ListResult<&SourceInfo>| {
-                        match result {
-                            ListResult::Item(source) => {
-                                debug!("{:?}", source);
+                        if let ListResult::Item(source) = result {
+                            debug!("{:?}", source);
 
-                                let _ = tx.blocking_send(crate::Command::Source {
-                                    ports: source
-                                        .ports
-                                        .iter()
-                                        .filter_map(|p| p.name.as_ref().map(|n| n.to_string()))
-                                        .collect(),
-                                });
-                            }
-                            _ => {}
+                            let _ = tx.blocking_send(crate::Command::Source {
+                                ports: source
+                                    .ports
+                                    .iter()
+                                    .filter_map(|p| p.name.as_ref().map(|n| n.to_string()))
+                                    .collect(),
+                            });
                         }
                     },
                 );
