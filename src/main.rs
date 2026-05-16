@@ -165,6 +165,8 @@ impl<'p> DbusManager<'p> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
+
     // Create a new channel with a capacity of at most 32.
     let (tx, mut rx) = mpsc::channel::<Command>(32);
     let tx2 = tx.clone();
