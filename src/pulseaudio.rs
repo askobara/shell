@@ -51,7 +51,7 @@ impl EventsWatcher {
             .map_err(anyhow::Error::from)?;
 
         loop {
-            match mainloop.borrow_mut().iterate(false) {
+            match mainloop.borrow_mut().iterate(true) {
                 IterateResult::Quit(_) | IterateResult::Err(_) => {
                     return Err(anyhow!("Iterate state was not success, quitting..."));
                 }
@@ -87,8 +87,11 @@ pub fn events(tx: Sender<crate::Command>) -> Result<()> {
     let watcher = EventsWatcher::new()?;
     let ctx = watcher.context.clone();
 
+    let prev_vol = Rc::new(RefCell::new(String::new()));
+
     let cb = move |facility, operation, index| {
         debug!("{:?} {:?} #{}", facility, operation, index);
+        let prev_vol = prev_vol.clone();
 
         match facility {
             Some(Facility::Sink) => {
@@ -98,10 +101,18 @@ pub fn events(tx: Sender<crate::Command>) -> Result<()> {
                     move |result: ListResult<&SinkInfo>| if let ListResult::Item(sink) = result {
                         debug!("{:?}", sink);
 
-                        let _ = tx.blocking_send(crate::Command::Volume {
-                            value: sink.volume.avg().print().trim().to_string(),
-                            mute: sink.mute,
-                        });
+                        let cur_vol = format!("{}_{}", sink.volume.avg(), sink.mute);
+
+                        if *(*prev_vol).borrow() != cur_vol {
+                            let _ = tx.blocking_send(crate::Command::Volume {
+                                value: sink.volume.avg().print().trim().to_string(),
+                                mute: sink.mute,
+                            });
+
+                            *prev_vol.borrow_mut() = cur_vol
+                        }
+
+
                     },
                 );
             }
@@ -139,6 +150,6 @@ pub fn events(tx: Sender<crate::Command>) -> Result<()> {
         .subscribe(InterestMaskSet::SINK | InterestMaskSet::SOURCE, |_| {});
 
     loop {
-        watcher.mainloop.borrow_mut().iterate(false);
+        watcher.mainloop.borrow_mut().iterate(true);
     }
 }
