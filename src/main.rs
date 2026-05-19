@@ -1,15 +1,16 @@
-use std::{collections::HashMap};
-use std::fmt;
 use log::debug;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::Result;
 
 use tokio::sync::mpsc::{self, Receiver};
 use zbus::{Connection, proxy, zvariant::Value};
 
-mod pulseaudio;
 mod hyprland;
+mod pulseaudio;
+mod udev;
 
 enum Icon {
     Keyboard,
@@ -51,10 +52,12 @@ enum Command {
         workspaces: Vec<Workspace>,
     },
     Volume {
+        name: Option<String>,
         value: String,
         mute: bool,
     },
     Source {
+        name: Option<String>,
         ports: Vec<String>,
     },
 }
@@ -92,7 +95,6 @@ struct DbusManager<'p> {
 
 impl<'p> DbusManager<'p> {
     async fn new(name: &str, dbus: &'p Connection) -> Result<Self> {
-
         Ok(Self {
             name: name.to_owned(),
             dbus,
@@ -103,20 +105,32 @@ impl<'p> DbusManager<'p> {
     async fn run(&self, rx: &mut Receiver<Command>) -> Result<()> {
         while let Some(message) = rx.recv().await {
             match message {
-                Command::ActiveWorkspace { id, workspaces } => self.workspace_change(&id, &workspaces).await?,
+                Command::ActiveWorkspace { id, workspaces } => {
+                    self.workspace_change(&id, &workspaces).await?
+                }
                 Command::KeyboardLayout { name } => {
-                    self.send_notification(&format!("{} {}", Icon::Keyboard, &name.to_lowercase()[..2])).await?;
-                },
-                Command::Volume { value, mute } => {
+                    self.send_notification(&format!(
+                        "{} {}",
+                        Icon::Keyboard,
+                        &name.to_lowercase()[..2]
+                    ))
+                    .await?;
+                }
+                Command::Volume {
+                    name: _,
+                    value,
+                    mute,
+                } => {
                     if mute {
                         self.send_notification(Icon::Muted.as_str()).await?;
                     } else {
-                        self.send_notification(&format!("{} {value}", Icon::Volume)).await?;
+                        self.send_notification(&format!("{} {value}", Icon::Volume))
+                            .await?;
                     }
-                },
+                }
                 _ => {
                     debug!("GOT = {:?}", message);
-                },
+                }
             }
         }
 
@@ -138,28 +152,41 @@ impl<'p> DbusManager<'p> {
                 ]),
                 700,
             )
-        .await?;
+            .await?;
 
         Ok(())
     }
 
     async fn workspace_change(&self, workspace_id: &str, workspaces: &[Workspace]) -> Result<()> {
         let id: u32 = workspace_id.parse()?;
-        let msg: Vec<&str> = workspaces.iter()
-            .map(|ws| {if ws.id == id { Icon::DotFull } else { Icon::DotOutline }}.as_str())
+        let msg: Vec<&str> = workspaces
+            .iter()
+            .map(|ws| {
+                {
+                    if ws.id == id {
+                        Icon::DotFull
+                    } else {
+                        Icon::DotOutline
+                    }
+                }
+                .as_str()
+            })
             .collect();
 
         self.send_notification(&msg.join(" ")).await
     }
 
     pub async fn awesomewm_eval(&self, code: &str) -> Result<zbus::Message> {
-        self.dbus.call_method(
-            Some("org.awesomewm.awful"),
-            "/",
-            Some("org.awesomewm.awful.Remote"),
-            "Eval",
-            &code,
-        ).await.map_err(anyhow::Error::from)
+        self.dbus
+            .call_method(
+                Some("org.awesomewm.awful"),
+                "/",
+                Some("org.awesomewm.awful.Remote"),
+                "Eval",
+                &code,
+            )
+            .await
+            .map_err(anyhow::Error::from)
     }
 }
 

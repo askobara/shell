@@ -53,8 +53,7 @@ pub async fn events(tx: &Sender<crate::Command>) -> Result<()> {
                                 }
                                 "workspacev2" => {
                                     if let Some((id, _name)) = payload.split_once(',') {
-                                        let mut ipc =
-                                            UnixStream::connect(&ipc_socket_path).await?;
+                                        let mut ipc = UnixStream::connect(&ipc_socket_path).await?;
                                         ipc.write_all(b"j/workspaces").await?;
                                         let mut buffer = Vec::new();
                                         ipc.read_to_end(&mut buffer).await?;
