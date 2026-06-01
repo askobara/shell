@@ -28,8 +28,12 @@ impl Icon {
             Icon::Keyboard => "",
             Icon::Volume => "",
             Icon::Muted => "󰖁",
-            Icon::DotFull => "●",
-            Icon::DotOutline => "○",
+            // Icon::DotFull => "●",
+            // Icon::DotOutline => "○",
+            // Icon::DotFull => "",
+            // Icon::DotOutline => "",
+            Icon::DotFull => "",
+            Icon::DotOutline => "",
             Icon::Microphone => "",
             Icon::Brightness => "󰃠",
         }
@@ -60,6 +64,10 @@ enum Command {
         name: Option<String>,
         ports: Vec<String>,
     },
+    BrightnessChanged {
+        value: u32,
+        device: String,
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -127,6 +135,14 @@ impl<'p> DbusManager<'p> {
                         self.send_notification(&format!("{} {value}", Icon::Volume))
                             .await?;
                     }
+                }
+                Command::BrightnessChanged { value, device: _ } => {
+                    self.send_notification(&format!(
+                        "{} {}",
+                        Icon::Brightness,
+                        value,
+                    ))
+                    .await?;
                 }
                 _ => {
                     debug!("GOT = {:?}", message);
@@ -197,6 +213,7 @@ async fn main() -> Result<()> {
     // Create a new channel with a capacity of at most 32.
     let (tx, mut rx) = mpsc::channel::<Command>(32);
     let tx2 = tx.clone();
+    let tx3 = tx.clone();
 
     let dbus = Connection::session().await?;
     let manager = DbusManager::new("my-app", &dbus).await?;
@@ -207,6 +224,10 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         let _ = hyprland::events(&tx2).await;
+    });
+
+    tokio::spawn(async move {
+        let _ = udev::events(&tx3).await;
     });
 
     manager.run(&mut rx).await
