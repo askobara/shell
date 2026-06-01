@@ -25,6 +25,7 @@ pub async fn events(tx: &Sender<crate::Command>) -> Result<()> {
 
     let ipc_socket_path = format!("{runtime_dir}/hypr/{signature}/.socket.sock");
     let events_socket_path = format!("{runtime_dir}/hypr/{signature}/.socket2.sock");
+    let mut prev_kb_layout: Option<String> = None;
 
     let events = UnixStream::connect(&events_socket_path).await?;
 
@@ -45,10 +46,16 @@ pub async fn events(tx: &Sender<crate::Command>) -> Result<()> {
                             match event_name {
                                 "activelayout" => {
                                     if let Some((_kb_name, layout_name)) = payload.split_once(',') {
+                                        if prev_kb_layout.as_ref().is_some_and(|v| v == layout_name) {
+                                            continue;
+                                        }
+
                                         tx.send(crate::Command::KeyboardLayout {
                                             name: layout_name.to_string(),
                                         })
                                         .await?;
+
+                                        prev_kb_layout.replace(layout_name.to_string());
                                     }
                                 }
                                 "workspacev2" => {
