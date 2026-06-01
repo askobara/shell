@@ -20,6 +20,8 @@ enum Icon {
     DotOutline,
     Microphone,
     Brightness,
+    PowerPlugOn,
+    PowerPlugOff,
 }
 
 impl Icon {
@@ -36,6 +38,8 @@ impl Icon {
             Icon::DotOutline => "",
             Icon::Microphone => "",
             Icon::Brightness => "󰃠",
+            Icon::PowerPlugOn => "󰚥",
+            Icon::PowerPlugOff => "󰚦",
         }
     }
 }
@@ -67,6 +71,9 @@ enum Command {
     BrightnessChanged {
         value: u32,
         device: String,
+    },
+    PowerSupplyChanged {
+        ac_status: u32,
     }
 }
 
@@ -141,6 +148,13 @@ impl<'p> DbusManager<'p> {
                         "{} {}",
                         Icon::Brightness,
                         value,
+                    ))
+                    .await?;
+                }
+                Command::PowerSupplyChanged { ac_status } => {
+                    self.send_notification(&format!(
+                        "{}",
+                        if ac_status == 1 { Icon::PowerPlugOn } else { Icon::PowerPlugOff },
                     ))
                     .await?;
                 }
