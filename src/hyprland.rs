@@ -46,7 +46,8 @@ pub async fn events(tx: &Sender<crate::Command>) -> Result<()> {
                             match event_name {
                                 "activelayout" => {
                                     if let Some((_kb_name, layout_name)) = payload.split_once(',') {
-                                        if prev_kb_layout.as_ref().is_some_and(|v| v == layout_name) {
+                                        if prev_kb_layout.as_ref().is_some_and(|v| v == layout_name)
+                                        {
                                             continue;
                                         }
 

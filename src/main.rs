@@ -74,7 +74,7 @@ enum Command {
     },
     PowerSupplyChanged {
         ac_status: u32,
-    }
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -144,17 +144,17 @@ impl<'p> DbusManager<'p> {
                     }
                 }
                 Command::BrightnessChanged { value, device: _ } => {
-                    self.send_notification(&format!(
-                        "{} {}",
-                        Icon::Brightness,
-                        value,
-                    ))
-                    .await?;
+                    self.send_notification(&format!("{} {}%", Icon::Brightness, value,))
+                        .await?;
                 }
                 Command::PowerSupplyChanged { ac_status } => {
                     self.send_notification(&format!(
                         "{}",
-                        if ac_status == 1 { Icon::PowerPlugOn } else { Icon::PowerPlugOff },
+                        if ac_status == 1 {
+                            Icon::PowerPlugOn
+                        } else {
+                            Icon::PowerPlugOff
+                        },
                     ))
                     .await?;
                 }
